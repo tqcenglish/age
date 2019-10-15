@@ -58,41 +58,48 @@ func ParseX25519Recipient(s string) (*X25519Recipient, error) {
 }
 
 func (r *X25519Recipient) Wrap(fileKey []byte) (*format.Recipient, error) {
+	arg, body, err := x25519Wrap(fileKey, r.theirPublicKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return &format.Recipient{
+		Type: "X25519",
+		Args: []string{arg},
+		Body: body,
+	}, nil
+}
+
+func x25519Wrap(fileKey, theirPublicKey []byte) (arg string, body []byte, err error) {
 	ephemeral := make([]byte, curve25519.ScalarSize)
 	if _, err := rand.Read(ephemeral); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	ourPublicKey, err := curve25519.X25519(ephemeral, curve25519.Basepoint)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	sharedSecret, err := curve25519.X25519(ephemeral, r.theirPublicKey)
+	sharedSecret, err := curve25519.X25519(ephemeral, theirPublicKey)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	l := &format.Recipient{
-		Type: "X25519",
-		Args: []string{format.EncodeToString(ourPublicKey)},
-	}
-
-	salt := make([]byte, 0, len(ourPublicKey)+len(r.theirPublicKey))
+	salt := make([]byte, 0, len(ourPublicKey)+len(theirPublicKey))
 	salt = append(salt, ourPublicKey...)
-	salt = append(salt, r.theirPublicKey...)
+	salt = append(salt, theirPublicKey...)
 	h := hkdf.New(sha256.New, sharedSecret, salt, []byte(x25519Label))
 	wrappingKey := make([]byte, chacha20poly1305.KeySize)
 	if _, err := io.ReadFull(h, wrappingKey); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
 	wrappedKey, err := aeadEncrypt(wrappingKey, fileKey)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	l.Body = wrappedKey
 
-	return l, nil
+	return format.EncodeToString(ourPublicKey), wrappedKey, nil
 }
 
 func (r *X25519Recipient) String() string {
@@ -154,25 +161,26 @@ func (i *X25519Identity) Unwrap(block *format.Recipient) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse X25519 recipient: %v", err)
 	}
-	if len(publicKey) != curve25519.PointSize {
-		return nil, errors.New("invalid X25519 recipient block")
-	}
 
-	sharedSecret, err := curve25519.X25519(i.secretKey, publicKey)
+	return x25519Unwrap(i.secretKey, i.ourPublicKey, publicKey, block.Body)
+}
+
+func x25519Unwrap(secretKey, ourPublicKey, publicKey, body []byte) ([]byte, error) {
+	sharedSecret, err := curve25519.X25519(secretKey, publicKey)
 	if err != nil {
-		return nil, fmt.Errorf("invalid X25519 recipient: %v", err)
+		return nil, fmt.Errorf("invalid recipient: %v", err)
 	}
 
-	salt := make([]byte, 0, len(publicKey)+len(i.ourPublicKey))
+	salt := make([]byte, 0, len(publicKey)+len(ourPublicKey))
 	salt = append(salt, publicKey...)
-	salt = append(salt, i.ourPublicKey...)
+	salt = append(salt, ourPublicKey...)
 	h := hkdf.New(sha256.New, sharedSecret, salt, []byte(x25519Label))
 	wrappingKey := make([]byte, chacha20poly1305.KeySize)
 	if _, err := io.ReadFull(h, wrappingKey); err != nil {
 		return nil, err
 	}
 
-	fileKey, err := aeadDecrypt(wrappingKey, block.Body)
+	fileKey, err := aeadDecrypt(wrappingKey, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt file key: %v", err)
 	}

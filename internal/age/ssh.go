@@ -7,7 +7,6 @@
 package age
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
@@ -18,9 +17,8 @@ import (
 	"io"
 	"math/big"
 
+	"github.com/FiloSottile/age/internal/curve25519"
 	"github.com/FiloSottile/age/internal/format"
-	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/ssh"
 )
@@ -57,13 +55,9 @@ func NewSSHRSARecipient(pk ssh.PublicKey) (*SSHRSARecipient, error) {
 }
 
 func (r *SSHRSARecipient) Wrap(fileKey []byte) (*format.Recipient, error) {
-	h := sha256.New()
-	h.Write(r.sshKey.Marshal())
-	hh := h.Sum(nil)
-
 	l := &format.Recipient{
 		Type: "ssh-rsa",
-		Args: []string{format.EncodeToString(hh[:4])},
+		Args: []string{sshKeyHash(r.sshKey)},
 	}
 
 	wrappedKey, err := rsa.EncryptOAEP(sha256.New(), rand.Reader,
@@ -103,18 +97,7 @@ func (i *SSHRSAIdentity) Unwrap(block *format.Recipient) ([]byte, error) {
 	if len(block.Args) != 1 {
 		return nil, errors.New("invalid ssh-rsa recipient block")
 	}
-	hash, err := format.DecodeString(block.Args[0])
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse ssh-rsa recipient: %v", err)
-	}
-	if len(hash) != 4 {
-		return nil, errors.New("invalid ssh-rsa recipient block")
-	}
-
-	h := sha256.New()
-	h.Write(i.sshKey.Marshal())
-	hh := h.Sum(nil)
-	if !bytes.Equal(hh[:4], hash) {
+	if block.Args[0] != sshKeyHash(i.sshKey) {
 		return nil, errors.New("wrong ssh-rsa key")
 	}
 
@@ -126,9 +109,16 @@ func (i *SSHRSAIdentity) Unwrap(block *format.Recipient) ([]byte, error) {
 	return fileKey, nil
 }
 
+func sshKeyHash(sshKey ssh.PublicKey) string {
+	h := sha256.New()
+	h.Write(sshKey.Marshal())
+	hh := h.Sum(nil)
+	return format.EncodeToString(hh[:4])
+}
+
 type SSHEd25519Recipient struct {
 	sshKey         ssh.PublicKey
-	theirPublicKey [32]byte
+	theirPublicKey []byte
 }
 
 var _ Recipient = &SSHEd25519Recipient{}
@@ -145,8 +135,7 @@ func NewSSHEd25519Recipient(pk ssh.PublicKey) (*SSHEd25519Recipient, error) {
 
 	if pk, ok := pk.(ssh.CryptoPublicKey); ok {
 		if pk, ok := pk.CryptoPublicKey().(ed25519.PublicKey); ok {
-			pubKey := ed25519PublicKeyToCurve25519(pk)
-			copy(r.theirPublicKey[:], pubKey)
+			r.theirPublicKey = ed25519PublicKeyToCurve25519(pk)
 		} else {
 			return nil, errors.New("unexpected public key type")
 		}
@@ -178,7 +167,13 @@ func ParseSSHRecipient(s string) (Recipient, error) {
 	return r, nil
 }
 
-var curve25519P, _ = new(big.Int).SetString("57896044618658097711785492504343953926634992332820282019728792003956564819949", 10)
+var curve25519P *big.Int // 2^255 - 19
+
+func init() {
+	curve25519P = big.NewInt(1)
+	curve25519P.Lsh(curve25519P, 255)
+	curve25519P.Sub(curve25519P, big.NewInt(19))
+}
 
 func ed25519PublicKeyToCurve25519(pk ed25519.PublicKey) []byte {
 	// ed25519.PublicKey is a little endian representation of the y-coordinate,
@@ -200,7 +195,7 @@ func ed25519PublicKeyToCurve25519(pk ed25519.PublicKey) []byte {
 	u := y.Mul(y.Add(y, big.NewInt(1)), denom)
 	u.Mod(u, curve25519P)
 
-	out := make([]byte, 32)
+	out := make([]byte, curve25519.PointSize)
 	uBytes := u.Bytes()
 	for i, b := range uBytes {
 		out[len(uBytes)-i-1] = b
@@ -211,52 +206,35 @@ func ed25519PublicKeyToCurve25519(pk ed25519.PublicKey) []byte {
 
 const ed25519Label = "age-tool.com ssh-ed25519"
 
+func ed25519Tweak(sshKey ssh.PublicKey) []byte {
+	tweak := make([]byte, curve25519.ScalarSize)
+	h := hkdf.New(sha256.New, nil, sshKey.Marshal(), []byte(ed25519Label))
+	if _, err := io.ReadFull(h, tweak); err != nil {
+		panic(fmt.Sprintf("age: internal error: HKDF read error: %v", err))
+	}
+	return tweak
+}
+
 func (r *SSHEd25519Recipient) Wrap(fileKey []byte) (*format.Recipient, error) {
-	// TODO: DRY this up with the X25519 implementation.
-	var ephemeral, ourPublicKey [32]byte
-	if _, err := rand.Read(ephemeral[:]); err != nil {
-		return nil, err
-	}
-	curve25519.ScalarBaseMult(&ourPublicKey, &ephemeral)
-
-	var sharedSecret, tweak [32]byte
-	tH := hkdf.New(sha256.New, nil, r.sshKey.Marshal(), []byte(ed25519Label))
-	if _, err := io.ReadFull(tH, tweak[:]); err != nil {
-		return nil, err
-	}
-	curve25519.ScalarMult(&sharedSecret, &ephemeral, &r.theirPublicKey)
-	curve25519.ScalarMult(&sharedSecret, &tweak, &sharedSecret)
-
-	sH := sha256.New()
-	sH.Write(r.sshKey.Marshal())
-	hh := sH.Sum(nil)
-
-	l := &format.Recipient{
-		Type: "ssh-ed25519",
-		Args: []string{format.EncodeToString(hh[:4]),
-			format.EncodeToString(ourPublicKey[:])},
-	}
-
-	salt := make([]byte, 0, 32*2)
-	salt = append(salt, ourPublicKey[:]...)
-	salt = append(salt, r.theirPublicKey[:]...)
-	h := hkdf.New(sha256.New, sharedSecret[:], salt, []byte(ed25519Label))
-	wrappingKey := make([]byte, chacha20poly1305.KeySize)
-	if _, err := io.ReadFull(h, wrappingKey); err != nil {
-		return nil, err
-	}
-
-	wrappedKey, err := aeadEncrypt(wrappingKey, fileKey)
+	pk, err := curve25519.X25519(ed25519Tweak(r.sshKey), r.theirPublicKey)
 	if err != nil {
 		return nil, err
 	}
-	l.Body = wrappedKey
 
-	return l, nil
+	arg, body, err := x25519Wrap(fileKey, pk)
+	if err != nil {
+		return nil, err
+	}
+
+	return &format.Recipient{
+		Type: "ssh-ed25519",
+		Args: []string{sshKeyHash(r.sshKey), arg},
+		Body: body,
+	}, nil
 }
 
 type SSHEd25519Identity struct {
-	secretKey, ourPublicKey [32]byte
+	secretKey, ourPublicKey []byte
 	sshKey                  ssh.PublicKey
 }
 
@@ -270,11 +248,10 @@ func NewSSHEd25519Identity(key ed25519.PrivateKey) (*SSHEd25519Identity, error) 
 		return nil, err
 	}
 	i := &SSHEd25519Identity{
-		sshKey: s.PublicKey(),
+		sshKey:    s.PublicKey(),
+		secretKey: ed25519PrivateKeyToCurve25519(key),
 	}
-	secretKey := ed25519PrivateKeyToCurve25519(key)
-	copy(i.secretKey[:], secretKey)
-	curve25519.ScalarBaseMult(&i.ourPublicKey, &i.secretKey)
+	i.ourPublicKey, _ = curve25519.X25519(i.secretKey, curve25519.Basepoint)
 	return i, nil
 }
 
@@ -302,56 +279,24 @@ func ed25519PrivateKeyToCurve25519(pk ed25519.PrivateKey) []byte {
 }
 
 func (i *SSHEd25519Identity) Unwrap(block *format.Recipient) ([]byte, error) {
-	// TODO: DRY this up with the X25519 implementation.
 	if block.Type != "ssh-ed25519" {
 		return nil, errors.New("wrong recipient block type")
 	}
 	if len(block.Args) != 2 {
 		return nil, errors.New("invalid ssh-ed25519 recipient block")
 	}
-	hash, err := format.DecodeString(block.Args[0])
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse ssh-ed25519 recipient: %v", err)
-	}
-	if len(hash) != 4 {
-		return nil, errors.New("invalid ssh-ed25519 recipient block")
+	if sshKeyHash(i.sshKey) != block.Args[0] {
+		return nil, errors.New("wrong ssh-ed25519 key")
 	}
 	publicKey, err := format.DecodeString(block.Args[1])
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse ssh-ed25519 recipient: %v", err)
 	}
-	if len(publicKey) != 32 {
-		return nil, errors.New("invalid ssh-ed25519 recipient block")
-	}
 
-	sH := sha256.New()
-	sH.Write(i.sshKey.Marshal())
-	hh := sH.Sum(nil)
-	if !bytes.Equal(hh[:4], hash) {
-		return nil, errors.New("wrong ssh-ed25519 key")
-	}
-
-	var sharedSecret, theirPublicKey, tweak [32]byte
-	copy(theirPublicKey[:], publicKey)
-	tH := hkdf.New(sha256.New, nil, i.sshKey.Marshal(), []byte(ed25519Label))
-	if _, err := io.ReadFull(tH, tweak[:]); err != nil {
-		return nil, err
-	}
-	curve25519.ScalarMult(&sharedSecret, &i.secretKey, &theirPublicKey)
-	curve25519.ScalarMult(&sharedSecret, &tweak, &sharedSecret)
-
-	salt := make([]byte, 0, 32*2)
-	salt = append(salt, theirPublicKey[:]...)
-	salt = append(salt, i.ourPublicKey[:]...)
-	h := hkdf.New(sha256.New, sharedSecret[:], salt, []byte(ed25519Label))
-	wrappingKey := make([]byte, chacha20poly1305.KeySize)
-	if _, err := io.ReadFull(h, wrappingKey); err != nil {
-		return nil, err
-	}
-
-	fileKey, err := aeadDecrypt(wrappingKey, block.Body)
+	pk, err := curve25519.X25519(ed25519Tweak(i.sshKey), publicKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt file key: %v", err)
+		return nil, err
 	}
-	return fileKey, nil
+
+	return x25519Unwrap(i.secretKey, i.ourPublicKey, pk, block.Body)
 }
