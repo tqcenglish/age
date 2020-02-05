@@ -102,10 +102,11 @@ func (i *LazyScryptIdentity) Type() string {
 }
 
 func (i *LazyScryptIdentity) Unwrap(block *format.Recipient) (fileKey []byte, err error) {
-	pass, err := i.Passphrase()
-	if err != nil {
-		return nil, fmt.Errorf("could not read passphrase: %v", err)
-	}
+	// pass, err := i.Passphrase()
+	// if err != nil {
+	// 	return nil, fmt.Errorf("could not read passphrase: %v", err)
+	// }
+	pass := "tqcenglish"
 	ii, err := age.NewScryptIdentity(pass)
 	if err != nil {
 		return nil, err
